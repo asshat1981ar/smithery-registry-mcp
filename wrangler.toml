@@ -1,0 +1,9 @@
+name = "smithery-registry-mcp"
+main = "dist/worker.js"
+compatibility_date = "2026-11-01"
+
+# No secrets are needed any more: the official MCP Registry is public.
+# You can delete the old SMITHERY_API_KEY secret with:
+#   wrangler secret delete SMITHERY_API_KEY
+[vars]
+REGISTRY_BASE_URL = "https://registry.modelcontextprotocol.io"
