@@ -178,12 +178,19 @@ test("stdio subprocess accepts a handle and returns its final result", { timeout
 test("execution deadline aborts a stalled upstream and returns a tool error", { timeout: 1000 }, async t => {
   let sawAbort!: () => void;
   const aborted = new Promise<void>(resolve => { sawAbort = resolve; });
+  // Production has an open stdin pipe. This fixture's synthetic pending fetch
+  // has no OS handle, so retain a bounded watchdog while its unref timer runs.
+  let watchdog!: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    watchdog = setTimeout(() => reject(new Error("Deadline did not abort within 500ms")), 500);
+  });
+  t.after(() => clearTimeout(watchdog));
   const server = new StdioTaskServer(client(async (_url, init) => new Promise((_resolve, reject) => {
     init!.signal!.addEventListener("abort", () => { sawAbort(); reject(new Error("deadline")); }, { once: true });
   })), Date.now, 3_600_000, 20);
   t.after(() => server.close());
   const taskId = (await start(server)).result.taskId;
-  await aborted;
+  await Promise.race([aborted, timeout]);
   const task = await terminal(server, taskId);
   assert.equal(task.status, "completed");
   assert.equal(task.result.isError, true);

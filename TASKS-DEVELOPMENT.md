@@ -84,6 +84,10 @@ original eight tools is preserved.
   against local HTTP fixture, exits cleanly at EOF.
 - One bounded live snapshot: completed, 1 page, 100 distinct active latest
   entries, partial=true and continuation cursor present. No full registry crawl.
+- CI on Node 22 exposed a fixture-only event-loop lifetime issue: its synthetic
+  pending fetch did not keep the process alive while the production deadline timer
+  was unreferenced. Added a 500 ms referenced watchdog to represent the open
+  stdio pipe; final local checks passed after the fix.
 - Checked expiry, isolation between server instances, capability omission on each
   lifecycle method, malformed input, cancellation abort, upstream failure, repeated
   cursor, partial coverage, response bytes, deadline, concurrency, retained capacity,
