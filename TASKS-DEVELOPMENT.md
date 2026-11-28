@@ -58,14 +58,16 @@ require a retained prior snapshot; that is deferred.
 
 Retries: none. Repeated calls create independent tasks. Polls are idempotent.
 Repeated cancel/update calls acknowledge known records; completed results persist
-until TTL. Updates never approve anything and ignore unknown response keys.
+until TTL, or until a new snapshot needs the slot of the oldest finished record. Updates never approve anything and ignore unknown response keys.
 
 Errors: `-32021` missing per-request Tasks declaration; `-32602` invalid arguments
-or unknown/expired task; `-32022` unsupported modern revision; `-32603` admission
-capacity. Upstream, cursor, response-size and execution-deadline failures become
-`completed` with a tool `isError`, without exposing upstream internals.
+or unknown/expired task; `-32022` unsupported modern revision; `-32603` when two
+snapshots are already running. Upstream, cursor, response-size and execution-deadline
+failures become `completed`: with a tool `isError` if no page was read, otherwise with
+the pages read, `partial: true` and `stopReason` (`deadline` or `upstream_error`).
+Upstream internals are not exposed.
 
-Bounds: 2 concurrent tasks; 32 retained records; 1 hour TTL from creation;
+Bounds: 2 concurrent tasks; 32 retained records (oldest finished evicted first); 1 hour TTL from creation;
 10 minute execution; 1,000 pages × 100 entries; 2 MiB per response;
 512 characters per server name; 4,096 per cursor; 1,000 names per category.
 Expired work is aborted and removed on the next task operation; deadline timers
@@ -109,3 +111,13 @@ keeping a single process and deterministic checks for this increment.
 
 Follow-up prompt: “Validate this exact commit with Claude Code over stdio and
 record a sanitized lifecycle transcript before attempting the LiteLLM relay.”
+
+## Review fixes (2026-11-28)
+
+An independent review of `36753fc` found five issues; four are fixed here, each with a regression test:
+
+1. A deadline or registry failure after some pages discarded every page read. Now kept, with `stopReason`.
+2. 32 finished or cancelled records refused new snapshots for up to an hour. Now the oldest finished record is evicted.
+3. Modern clients without the Tasks declaration were offered `registry_snapshot`. Now hidden from them.
+4. Not changed: the `-32022` data lists legacy versions. SDK guidance treats `supported` as the versions a client can fall back to, and legacy versions are reachable through `initialize`, so this needs a check against a real dual-era client before changing it.
+5. The task handle lacked `io.modelcontextprotocol/serverInfo`. Now included.

@@ -57,7 +57,8 @@ export class StdioTaskServer {
     const declared = modern && object(extensions) && object(extensions[TASKS_EXTENSION]);
     const complete = (result: Record<string, unknown>) => ({ ...result, resultType: "complete", _meta: { "io.modelcontextprotocol/serverInfo": SERVER_INFO } });
     if (req.method === "server/discover") return reply(complete({ supportedVersions: VERSIONS, capabilities: { tools: {}, extensions: { [TASKS_EXTENSION]: {} } }, instructions: "registry_snapshot is task-backed on stdio only. Tasks belong to this process and are lost on exit." }));
-    if (req.method === "tools/list") return reply(modern ? complete({ tools: [...TOOLS, SNAPSHOT_TOOL] }) : { tools: TOOLS });
+    // Only offer the task-backed tool to requests that can call it.
+    if (req.method === "tools/list") return reply(modern ? complete({ tools: declared ? [...TOOLS, SNAPSHOT_TOOL] : TOOLS }) : { tools: TOOLS });
     const isSnapshot = req.method === "tools/call" && req.params?.name === SNAPSHOT_TOOL.name;
     const isTask = ["tasks/get", "tasks/cancel", "tasks/update"].includes(req.method);
     if (isSnapshot || isTask) {
@@ -66,18 +67,29 @@ export class StdioTaskServer {
       if (isSnapshot) {
         let args;
         try { args = parseSnapshotArgs(req.params?.arguments); } catch (e) { return error(-32602, (e as Error).message); }
-        if (this.tasks.size >= 32 || [...this.tasks.values()].filter(e => e.task.status === "working").length >= 2) return error(-32603, "Task capacity reached; wait for completion or expiry");
+        if ([...this.tasks.values()].filter(e => e.task.status === "working").length >= 2) return error(-32603, "Two snapshots are already running; wait for one to finish or cancel it");
+        // At the retained limit, make room by evicting the oldest finished record (Map order is creation order).
+        if (this.tasks.size >= 32) {
+          const oldest = [...this.tasks].find(([, e]) => e.task.status !== "working");
+          if (!oldest) return error(-32603, "Task capacity reached; wait for completion or expiry");
+          clearTimeout(oldest[1].timer); this.tasks.delete(oldest[0]);
+        }
         const timestamp = new Date(this.now()).toISOString();
         const task: Task = { taskId: randomUUID(), status: "working", createdAt: timestamp, lastUpdatedAt: timestamp, ttlMs: this.ttlMs, pollIntervalMs: 5000, statusMessage: "Snapshot queued" };
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), Math.min(this.executionMs, this.ttlMs));
         timer.unref();
         this.tasks.set(task.taskId, { task, controller, timer });
-        const handle = { ...task, resultType: "task" };
+        const handle = { ...task, resultType: "task", _meta: { "io.modelcontextprotocol/serverInfo": SERVER_INFO } };
         // Store before returning the handle; execution starts on a later event-loop turn.
         setImmediate(() => {
           void crawlSnapshot(this.client, args, controller.signal, message => { task.statusMessage = message; task.lastUpdatedAt = new Date(this.now()).toISOString(); })
-            .then(result => { controller.signal.throwIfAborted(); task.result = { ...result, resultType: "complete" }; task.status = "completed"; task.statusMessage = "Snapshot completed"; })
+            .then(result => {
+              // Cancellation wins; a deadline still keeps the pages read before it (structuredContent.stopReason).
+              if (task.status === "cancelled") return;
+              task.result = { ...result, resultType: "complete" }; task.status = "completed";
+              task.statusMessage = (result.structuredContent as { partial?: boolean } | undefined)?.partial ? "Snapshot completed with partial coverage" : "Snapshot completed";
+            })
             .catch(() => {
               if (task.status === "cancelled") return;
               // Upstream/network/limit failures are tool errors, not JSON-RPC failures.
