@@ -4,7 +4,7 @@ import type { ToolDef, ToolResult } from "./tools.js";
 export const SNAPSHOT_TOOL: ToolDef = {
   name: "registry_snapshot",
   title: "Snapshot the MCP Registry",
-  description: "Read latest registry entries across up to max_pages pages (100 entries/page). Requires the Tasks extension on this stdio request. Returns a task immediately; poll tasks/get. Results report partial coverage and capped name lists. Does not install or execute servers. Publication dates describe the latest version, not when a server first appeared.",
+  description: "Read latest registry entries across up to max_pages pages (100 entries/page). Requires the Tasks extension on this stdio request. Returns a task immediately; poll tasks/get. Results report partial coverage (stopReason: page_limit, deadline or upstream_error) and capped name lists; pages read before a deadline or upstream failure are kept. Does not install or execute servers. Publication dates describe the latest version, not when a server first appeared.",
   inputSchema: {
     type: "object", additionalProperties: false,
     properties: {
@@ -14,7 +14,7 @@ export const SNAPSHOT_TOOL: ToolDef = {
   },
   outputSchema: {
     type: "object", additionalProperties: false,
-    required: ["counts", "names", "namesTruncated", "pages", "partial", "nextCursor", "updatedSince"],
+    required: ["counts", "names", "namesTruncated", "pages", "partial", "stopReason", "nextCursor", "updatedSince"],
     properties: {
       counts: { type: "object", additionalProperties: false,
         required: ["total", "active", "deprecated", "deleted", "unknown", "published_since", "updated_since"],
@@ -22,7 +22,7 @@ export const SNAPSHOT_TOOL: ToolDef = {
       names: { type: "object", additionalProperties: false, required: ["published_since", "updated_since", "deprecated"],
         properties: Object.fromEntries(["published_since", "updated_since", "deprecated"].map(key => [key, { type: "array", maxItems: 1000, items: { type: "string", maxLength: 512 } }])) },
       namesTruncated: { type: "boolean" }, pages: { type: "integer", minimum: 1, maximum: 1000 },
-      partial: { type: "boolean" }, nextCursor: { type: ["string", "null"], maxLength: 4096 }, updatedSince: { type: ["string", "null"] },
+      partial: { type: "boolean" }, stopReason: { enum: ["complete", "page_limit", "deadline", "upstream_error"] }, nextCursor: { type: ["string", "null"], maxLength: 4096 }, updatedSince: { type: ["string", "null"] },
     },
   },
   annotations: { readOnlyHint: true, openWorldHint: true, idempotentHint: false },
@@ -53,33 +53,47 @@ export async function crawlSnapshot(client: RegistryClient, args: SnapshotArgs, 
     if (names[key].length < 1000) names[key].push(name); else namesTruncated = true;
   };
   const since = args.updated_since === undefined ? undefined : Date.parse(args.updated_since);
-  do {
-    signal.throwIfAborted();
-    const page = await client.search({ limit: 100, cursor, updatedSince: args.updated_since, signal, maxResponseBytes: 2 * 1024 * 1024 });
-    signal.throwIfAborted();
-    if (!Array.isArray(page.servers) || page.servers.length > 100) throw new Error("Invalid registry page");
-    for (const entry of page.servers) {
-      const name = entry?.server?.name;
-      if (typeof name !== "string" || !name || name.length > 512) throw new Error("Invalid registry server name");
-      if (seenNames.has(name)) continue;
-      seenNames.add(name);
-      counts.total++;
-      const meta = officialMeta(entry);
-      const status = meta.status;
-      if (status === "active" || status === "deprecated" || status === "deleted") counts[status]++;
-      else counts.unknown++;
-      if (status === "deprecated") addName("deprecated", name);
-      if (since !== undefined && Date.parse(meta.publishedAt ?? "") > since) { counts.published_since++; addName("published_since", name); }
-      if (since !== undefined && Date.parse(meta.updatedAt ?? "") > since) { counts.updated_since++; addName("updated_since", name); }
-    }
-    pages++;
-    progress(`${pages} pages, ${counts.total} distinct latest entries read`);
-    const next = page.metadata?.nextCursor;
-    if (next !== undefined && (typeof next !== "string" || next.length > 4096)) throw new Error("Invalid registry cursor");
-    cursor = next || undefined;
-    if (cursor && seenCursors.has(cursor)) throw new Error("Registry repeated a pagination cursor");
-    if (cursor) seenCursors.add(cursor);
-  } while (cursor && pages < args.max_pages);
-  const data = { counts, names, namesTruncated, pages, partial: Boolean(cursor), nextCursor: cursor ?? null, updatedSince: args.updated_since ?? null };
-  return { content: [{ type: "text", text: `Read ${counts.total} distinct latest entries in ${pages} pages${cursor ? " (partial: page bound reached)" : ""}. This is a paginated observation, not an atomic registry snapshot.` }], structuredContent: data };
+  let stopReason: "complete" | "page_limit" | "deadline" | "upstream_error" = "complete";
+  try {
+    do {
+      signal.throwIfAborted();
+      const page = await client.search({ limit: 100, cursor, updatedSince: args.updated_since, signal, maxResponseBytes: 2 * 1024 * 1024 });
+      signal.throwIfAborted();
+      // Validate the whole page and its cursor before counting, so a bad page never half-counts.
+      if (!Array.isArray(page.servers) || page.servers.length > 100) throw new Error("Invalid registry page");
+      for (const entry of page.servers) {
+        const name = entry?.server?.name;
+        if (typeof name !== "string" || !name || name.length > 512) throw new Error("Invalid registry server name");
+      }
+      const next = page.metadata?.nextCursor;
+      if (next !== undefined && (typeof next !== "string" || next.length > 4096)) throw new Error("Invalid registry cursor");
+      if (next && seenCursors.has(next)) throw new Error("Registry repeated a pagination cursor");
+      for (const entry of page.servers) {
+        const name = entry.server.name;
+        if (seenNames.has(name)) continue;
+        seenNames.add(name);
+        counts.total++;
+        const meta = officialMeta(entry);
+        const status = meta.status;
+        if (status === "active" || status === "deprecated" || status === "deleted") counts[status]++;
+        else counts.unknown++;
+        if (status === "deprecated") addName("deprecated", name);
+        if (since !== undefined && Date.parse(meta.publishedAt ?? "") > since) { counts.published_since++; addName("published_since", name); }
+        if (since !== undefined && Date.parse(meta.updatedAt ?? "") > since) { counts.updated_since++; addName("updated_since", name); }
+      }
+      pages++;
+      progress(`${pages} pages, ${counts.total} distinct latest entries read`);
+      cursor = next || undefined;
+      if (cursor) seenCursors.add(cursor);
+    } while (cursor && pages < args.max_pages);
+    if (cursor) stopReason = "page_limit";
+  } catch (e) {
+    // Nothing read: the task reports a tool error. Otherwise keep what was read and say why it stopped.
+    if (pages === 0) throw e;
+    stopReason = signal.aborted ? "deadline" : "upstream_error";
+  }
+  const partial = stopReason !== "complete";
+  const data = { counts, names, namesTruncated, pages, partial, stopReason, nextCursor: partial ? cursor ?? null : null, updatedSince: args.updated_since ?? null };
+  const why = { complete: "", page_limit: " (partial: page bound reached)", deadline: " (partial: execution deadline reached)", upstream_error: " (partial: registry error or invalid page; later pages not read)" }[stopReason];
+  return { content: [{ type: "text", text: `Read ${counts.total} distinct latest entries in ${pages} pages${why}. This is a paginated observation, not an atomic registry snapshot.` }], structuredContent: data };
 }

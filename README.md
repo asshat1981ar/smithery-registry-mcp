@@ -83,10 +83,13 @@ The response is a flat `resultType: "task"` handle. Send `tasks/get` with its
 Both acknowledge with `{ "resultType": "complete" }` (plus server metadata).
 
 Limits: 1–1,000 pages, 100 entries/page, 2 MiB/page, 10 minutes execution,
-2 concurrent crawls, 32 retained task records, one hour TTL from creation,
-and 1,000 names per output category. There are no automatic retries.
-`partial` and `nextCursor` indicate a page-bound crawl; `namesTruncated` indicates
-capped lists. Counts cover distinct names observed, not an atomic registry state.
+2 concurrent crawls, 32 retained task records (starting a 33rd evicts the oldest
+finished one), one hour TTL from creation, and 1,000 names per output category.
+There are no automatic retries. `partial` and `nextCursor` mean coverage stopped
+early; `stopReason` says why (`page_limit`, `deadline` or `upstream_error`), and
+pages read before a deadline or registry failure are kept. A failure before the
+first page is a tool `isError`. `namesTruncated` indicates capped lists.
+Only requests that declare the Tasks extension see `registry_snapshot` in `tools/list`. Counts cover distinct names observed, not an atomic registry state.
 `updated_since` is an optional RFC 3339 registry filter. `published_since` refers
 to latest-version publication dates, not newly discovered server identities.
 

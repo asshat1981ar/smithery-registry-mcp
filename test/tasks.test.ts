@@ -103,13 +103,31 @@ test("cancellation aborts in-flight fetch and does not overwrite terminal state"
   assert.equal((await send(server, "tasks/get", { taskId })).result.status, "cancelled");
 });
 
-test("upstream and repeated cursor errors are completed tool errors", async t => {
-  for (const fetcher of [async () => response({}, 503), async () => response({ servers: [], metadata: { nextCursor: "loop" } })]) {
-    const server = new StdioTaskServer(client(fetcher)); t.after(() => server.close());
-    const taskId = (await start(server)).result.taskId;
-    const task = await terminal(server, taskId);
-    assert.equal(task.status, "completed"); assert.equal(task.result.isError, true);
-  }
+test("upstream errors before any page are completed tool errors", async t => {
+  const server = new StdioTaskServer(client(async () => response({}, 503))); t.after(() => server.close());
+  const task = await terminal(server, (await start(server)).result.taskId);
+  assert.equal(task.status, "completed"); assert.equal(task.result.isError, true);
+  assert.equal(task.result.structuredContent, undefined);
+});
+
+test("a repeated cursor keeps the pages already read and reports upstream_error", async t => {
+  const server = new StdioTaskServer(client(async () => response({ servers: [entry("test/loop")], metadata: { nextCursor: "loop" } }))); t.after(() => server.close());
+  const task = await terminal(server, (await start(server)).result.taskId);
+  assert.equal(task.status, "completed"); assert.notEqual(task.result.isError, true);
+  const data = task.result.structuredContent;
+  assert.equal(data.pages, 1); assert.equal(data.counts.total, 1);
+  assert.equal(data.partial, true); assert.equal(data.stopReason, "upstream_error");
+});
+
+test("an upstream failure mid-crawl keeps earlier pages (regression: review finding 1)", async t => {
+  let n = 0;
+  const server = new StdioTaskServer(client(async () => (++n < 3 ? response({ servers: [entry(`test/${n}`)], metadata: { nextCursor: `c${n}` } }) : response({}, 503)))); t.after(() => server.close());
+  const task = await terminal(server, (await start(server)).result.taskId);
+  const data = task.result.structuredContent;
+  assert.equal(task.status, "completed"); assert.notEqual(task.result.isError, true);
+  assert.equal(data.pages, 2); assert.equal(data.counts.total, 2);
+  assert.equal(data.partial, true); assert.equal(data.stopReason, "upstream_error"); assert.equal(data.nextCursor, "c2");
+  assert.match(task.result.content[0].text, /partial: registry error/);
 });
 
 test("page bound reports partial coverage without a second fetch", async () => {
@@ -197,10 +215,14 @@ test("execution deadline aborts a stalled upstream and returns a tool error", { 
   assert.match(task.result.content[0].text, /deadline/);
 });
 
-test("retained task capacity is bounded even after completion", async t => {
+test("retained capacity evicts the oldest finished record instead of refusing (regression: review finding 2)", async t => {
   const server = new StdioTaskServer(client()); t.after(() => server.close());
-  for (let i = 0; i < 32; i++) await terminal(server, (await start(server)).result.taskId);
-  assert.equal((await start(server)).error.code, -32603);
+  const ids: string[] = [];
+  for (let i = 0; i < 32; i++) { const id = (await start(server)).result.taskId; ids.push(id); await terminal(server, id); if (i % 2) await send(server, "tasks/cancel", { taskId: id }); }
+  const next = await start(server);
+  assert.equal(next.result.resultType, "task");
+  assert.equal((await send(server, "tasks/get", { taskId: ids[0] })).error.code, -32602, "oldest finished record evicted");
+  assert.equal((await send(server, "tasks/get", { taskId: ids[1] })).result.status, "completed", "newer records kept");
 });
 
 test("long name lists are capped while counts remain accurate", async () => {
@@ -214,4 +236,52 @@ test("long name lists are capped while counts remain accurate", async () => {
   assert.equal(data.names.deprecated.length, 1000);
   assert.equal(data.namesTruncated, true);
   assert.equal(data.partial, false);
+});
+
+test("execution deadline after some pages returns the pages read (regression: review finding 1)", { timeout: 1000 }, async t => {
+  let n = 0;
+  let watchdog!: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<never>((_resolve, reject) => { watchdog = setTimeout(() => reject(new Error("Deadline did not settle within 500ms")), 500); });
+  t.after(() => clearTimeout(watchdog));
+  const server = new StdioTaskServer(client(async (_url, init) => {
+    if (++n <= 3) return response({ servers: [entry(`test/${n}`)], metadata: { nextCursor: `c${n}` } });
+    return new Promise((_resolve, reject) => init!.signal!.addEventListener("abort", () => reject(new Error("deadline")), { once: true }));
+  }), Date.now, 3_600_000, 20);
+  t.after(() => server.close());
+  const taskId = (await start(server, { max_pages: 10 })).result.taskId;
+  let task: any;
+  await Promise.race([(async () => { for (;;) { task = (await send(server, "tasks/get", { taskId })).result; if (task.status !== "working") return; await new Promise(r => setTimeout(r, 5)); } })(), timeout]);
+  assert.equal(task.status, "completed"); assert.notEqual(task.result.isError, true);
+  const data = task.result.structuredContent;
+  assert.equal(data.pages, 3); assert.equal(data.counts.total, 3);
+  assert.equal(data.partial, true); assert.equal(data.stopReason, "deadline"); assert.equal(data.nextCursor, "c3");
+});
+
+test("cancel still wins when the crawl returns partial data after the abort", async t => {
+  let n = 0; let stalled!: () => void; const reached = new Promise<void>(resolve => { stalled = resolve; });
+  const server = new StdioTaskServer(client(async (_url, init) => {
+    if (++n === 1) return response({ servers: [entry("test/1")], metadata: { nextCursor: "c1" } });
+    stalled();
+    return new Promise((_resolve, reject) => init!.signal!.addEventListener("abort", () => reject(new Error("aborted")), { once: true }));
+  })); t.after(() => server.close());
+  const taskId = (await start(server)).result.taskId;
+  await reached;
+  await send(server, "tasks/cancel", { taskId });
+  await tick(); await tick();
+  const task = (await send(server, "tasks/get", { taskId })).result;
+  assert.equal(task.status, "cancelled"); assert.equal(task.result, undefined);
+});
+
+test("modern clients without the Tasks declaration are not offered the snapshot tool (regression: review finding 3)", async t => {
+  const server = new StdioTaskServer(client()); t.after(() => server.close());
+  const undeclared = await send(server, "tools/list", {}, false);
+  assert.equal(undeclared.result.tools.length, 8);
+  assert.ok(!undeclared.result.tools.some((tool: any) => tool.name === "registry_snapshot"));
+  assert.equal((await send(server, "tools/list")).result.tools.length, 9);
+});
+
+test("the task handle carries serverInfo like other modern results (regression: review finding 5)", async t => {
+  const server = new StdioTaskServer(client()); t.after(() => server.close());
+  const handle = (await start(server)).result;
+  assert.equal(handle._meta["io.modelcontextprotocol/serverInfo"].name, "smithery-registry-mcp");
 });
