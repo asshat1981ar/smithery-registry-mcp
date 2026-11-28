@@ -5,6 +5,7 @@ export interface ToolDef {
   title: string;
   description: string;
   inputSchema: Record<string, unknown>;
+  outputSchema?: Record<string, unknown>;
   annotations: { readOnlyHint: boolean; openWorldHint: boolean; idempotentHint?: boolean };
 }
 

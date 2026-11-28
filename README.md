@@ -26,7 +26,7 @@ All eight tools are read-only.
 
 ```bash
 npm install
-npm test          # 14 offline tests against a mocked registry
+npm test          # offline regression, task lifecycle, and stdio subprocess tests
 npm run test:live # adds a check against the real registry
 ```
 
@@ -45,3 +45,61 @@ wrangler secret delete SMITHERY_API_KEY   # optional clean-up: v2 never reads it
 ```json
 { "mcpServers": { "mcp-registry": { "type": "http", "url": "https://smithery-registry-mcp.<your-subdomain>.workers.dev/mcp" } } }
 ```
+
+
+## Task-backed snapshots (stdio, development branch)
+
+Modern stdio clients using protocol `2026-07-28` can discover a ninth read-only tool,
+`registry_snapshot`. The eight existing tools retain their synchronous behavior.
+HTTP Workers continue serving legacy protocols and do not advertise Tasks.
+This change is stacked on the unmerged v2 rewrite; it is not a published npm release.
+
+Build locally and configure your client to run `node /absolute/path/to/dist/stdio.js`.
+The client must send the following metadata on **each** modern request:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "registry_snapshot",
+    "arguments": { "max_pages": 1 },
+    "_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientCapabilities": {
+        "extensions": { "io.modelcontextprotocol/tasks": {} }
+      }
+    }
+  }
+}
+```
+
+The response is a flat `resultType: "task"` handle. Send `tasks/get` with its
+`taskId` and the same metadata; honor `pollIntervalMs: 5000`. A terminal
+`completed` task contains the ordinary tool result, including `structuredContent`.
+`isError: true` is also a completed task. `tasks/cancel` stops unfinished work;
+`tasks/update` accepts an `inputResponses` object but this tool requests no input.
+Both acknowledge with `{ "resultType": "complete" }` (plus server metadata).
+
+Limits: 1–1,000 pages, 100 entries/page, 2 MiB/page, 10 minutes execution,
+2 concurrent crawls, 32 retained task records, one hour TTL from creation,
+and 1,000 names per output category. There are no automatic retries.
+`partial` and `nextCursor` indicate a page-bound crawl; `namesTruncated` indicates
+capped lists. Counts cover distinct names observed, not an atomic registry state.
+`updated_since` is an optional RFC 3339 registry filter. `published_since` refers
+to latest-version publication dates, not newly discovered server identities.
+
+Task IDs are random UUIDs and scoped to this server process. The local stdio
+pipe and OS process boundary supply caller isolation; clientInfo is never used
+as authentication. Closing stdin, process exit, or restart discards all tasks.
+Persistent HTTP tasks require a separate authorized storage design.
+
+For independent upstream-schema validation (optional Python test dependency):
+
+```bash
+python3 -m pip install -r test/requirements-schema.txt
+npm run test:schema
+```
+
+See [TASKS-DEVELOPMENT.md](TASKS-DEVELOPMENT.md) for evidence and remaining gates.
