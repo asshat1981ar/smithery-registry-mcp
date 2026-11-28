@@ -2,9 +2,10 @@
 // stdio entry: newline-delimited JSON-RPC on stdin/stdout. Logs go to stderr only.
 import { createInterface } from "node:readline";
 import { DEFAULT_REGISTRY, RegistryClient } from "./registry.js";
-import { handlePayload } from "./jsonrpc.js";
+import { StdioTaskServer } from "./task-server.js";
 
 const client = new RegistryClient(process.env.REGISTRY_BASE_URL || DEFAULT_REGISTRY);
+const server = new StdioTaskServer(client);
 const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
 let pending = 0;
 let closed = false;
@@ -20,7 +21,7 @@ rl.on("line", async (line) => {
       process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } }) + "\n");
       return;
     }
-    const out = await handlePayload(client, msg);
+    const out = await server.handle(msg);
     if (out !== null) process.stdout.write(JSON.stringify(out) + "\n");
   } catch (e) {
     console.error("smithery-registry-mcp:", (e as Error).message);
@@ -30,6 +31,7 @@ rl.on("line", async (line) => {
   }
 });
 rl.on("close", () => {
+  server.close();
   closed = true;
   if (pending === 0) process.exit(0);
 });

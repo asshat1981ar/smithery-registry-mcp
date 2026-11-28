@@ -4,14 +4,19 @@
   "description": "MCP server that searches the official MCP Registry (registry.modelcontextprotocol.io). Replaces the Smithery-backed v1, since Smithery's API shut down on 2026-10-31.",
   "type": "module",
   "license": "MIT",
-  "bin": { "smithery-registry-mcp": "dist/stdio.js" },
+  "bin": {
+    "smithery-registry-mcp": "dist/stdio.js"
+  },
   "main": "dist/worker.js",
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json && tsc -p tsconfig.test.json",
     "test": "npm run build && node --test dist-test/test/*.test.js",
     "test:live": "npm run build && LIVE=1 node --test dist-test/test/*.test.js",
-    "deploy": "npm run build && wrangler deploy"
+    "deploy": "npm run build && wrangler deploy",
+    "test:schema": "npm run build && python3 test/check-schema.py"
   },
   "devDependencies": {
     "typescript": "5.9.3",

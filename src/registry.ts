@@ -72,23 +72,44 @@ export class RegistryClient {
     this.base = base.replace(/\/+$/, "");
   }
 
-  private async get<T>(path: string): Promise<T> {
+  private async get<T>(path: string, signal?: AbortSignal, maxBytes?: number): Promise<T> {
     const res = await this.fetchImpl(this.base + path, {
       headers: { accept: "application/json", "user-agent": "smithery-registry-mcp/2.0" },
+      signal,
     });
     if (res.status === 404) throw new RegistryError("Not found in the MCP Registry", 404);
     if (!res.ok) throw new RegistryError(`MCP Registry returned HTTP ${res.status}`, res.status);
-    return (await res.json()) as T;
+    if (!maxBytes) return (await res.json()) as T;
+    const reader = res.body?.getReader();
+    if (!reader) throw new RegistryError("Registry returned an empty body");
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        size += value.byteLength;
+        if (size > maxBytes) throw new RegistryError("Registry page exceeds response byte limit");
+        chunks.push(value);
+      }
+    } finally {
+      await reader.cancel();
+      reader.releaseLock();
+    }
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
+    return JSON.parse(new TextDecoder().decode(bytes)) as T;
   }
 
   /** Search latest versions. `query` matches server names; empty lists everything. */
-  async search(opts: { query?: string; limit?: number; cursor?: string; updatedSince?: string } = {}): Promise<ListResponse> {
+  async search(opts: { query?: string; limit?: number; cursor?: string; updatedSince?: string; signal?: AbortSignal; maxResponseBytes?: number } = {}): Promise<ListResponse> {
     const p = new URLSearchParams({ version: "latest" });
     if (opts.query) p.set("search", opts.query);
     p.set("limit", String(clamp(opts.limit ?? 10, 1, 100)));
     if (opts.cursor) p.set("cursor", opts.cursor);
     if (opts.updatedSince) p.set("updated_since", opts.updatedSince);
-    return this.get<ListResponse>(`/v0/servers?${p}`);
+    return this.get<ListResponse>(`/v0/servers?${p}`, opts.signal, opts.maxResponseBytes);
   }
 
   /** One server by its reverse-DNS name, e.g. "io.github.github/github-mcp-server". */
